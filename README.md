@@ -47,6 +47,16 @@ Xiaomi Civi 5 Pro（`luming` / SM8735）运行 iOS 17.7.11（21H461）的**移�
 | Stage 20 | 多页 kcdata 解析（backboardd/SpringBoard/launchd/lsd） | 定位 lsd worker 的 Mach IPC 等待 |
 | Stage 21 | 调用者 LR / owner batch | 捕获 `__posix_spawn`、CoreFoundation、BaseBoard 调用链 |
 
+## 源码
+
+- [`source/device/`](source/device/)：设备仓库树（stage10–18 诊断集成、patches、drivers、kits、configs）
+- [`source/stage19p4/`](source/stage19p4/)：stackshot 采集
+- [`source/stage20/`](source/stage20/)：lsd 多页/多实例解析
+- [`source/stage21/`](source/stage21/)：owner 调用链采集
+- 说明见 [source/README.md](source/README.md)
+
+源码镜像**不含** Apple 固件/二进制/反汇编、构建产物或任何凭据。
+
 ## 复现与构建
 
 - CI 仓库：[`infinityEX-RSXQ/UniXNU-luming-f2-ci`](https://github.com/infinityEX-RSXQ/UniXNU-luming-f2-ci)（公开）

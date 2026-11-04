@@ -1,0 +1,256 @@
+name: apfs-dyld
+on:
+  workflow_dispatch:
+    inputs:
+      ipsw_url:
+        description: "Apple IPSW URL"
+        required: true
+        type: string
+      release_tag:
+        description: "Private release tag"
+        required: true
+        type: string
+        default: "apfs-dyld-21H461-10g"
+      runner_label:
+        description: "macOS runner label"
+        required: false
+        type: string
+        default: "macos-15"
+permissions:
+  contents: read
+jobs:
+  prepare:
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 180
+    env:
+      PRIVATE_REPOSITORY: infinityEX-RSXQ/luming-macos-prep
+      PRIVATE_UPLOAD_TOKEN: ${{ secrets.PRIVATE_UPLOAD_TOKEN }}
+      IPSW_URL: ${{ inputs.ipsw_url }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Disk before
+        run: df -h /
+      - name: Download IPSW
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/apfs
+          cd /tmp/apfs
+          curl -fL --retry 5 --retry-all-errors "$IPSW_URL" -o restore.ipsw
+          ls -lh restore.ipsw
+      - name: Extract SystemOS and copy dyld cache
+        run: |
+          set -euo pipefail
+          cd /tmp/apfs
+          unzip -j restore.ipsw '044-76034-038.dmg'
+          mkdir -p dyldcache
+          hdiutil attach -readonly -nobrowse -mountpoint "$PWD/sysos" 044-76034-038.dmg
+          find sysos -path '*com.apple.dyld*' -o -name 'dyld_shared_cache*' | tee /tmp/dyld-list.txt
+          cache_dir=$(find sysos -type d -name 'com.apple.dyld' -print -quit)
+          [ -n "$cache_dir" ] || { echo "::error::com.apple.dyld directory missing"; exit 1; }
+          cp -a "$cache_dir"/. dyldcache/
+          find dyldcache -type f -exec shasum -a 256 {} \; | tee /tmp/dyld-sha.txt
+          du -sh dyldcache
+          hdiutil detach "$PWD/sysos"
+          rm -f 044-76034-038.dmg
+          df -h /
+      - name: Extract OS and convert to writable UDRW
+        run: |
+          set -euo pipefail
+          cd /tmp/apfs
+          unzip -j restore.ipsw '044-76040-038.dmg'
+          rm -f restore.ipsw
+          hdiutil convert -format UDRW -o os-rw.dmg 044-76040-038.dmg
+          rm -f 044-76040-038.dmg
+          ls -lh os-rw.dmg
+          df -h /
+      - name: Resize OS disk and APFS container to 10g
+        run: |
+          set -euo pipefail
+          cd /tmp/apfs
+          hdiutil resize -size 10g os-rw.dmg
+          hdiutil attach -readwrite -nobrowse -nomount os-rw.dmg | tee /tmp/attach-nomount.txt
+          DISK=$(awk '/\/dev\/disk/ {print $1; exit}' /tmp/attach-nomount.txt)
+          PART="${DISK}s1"
+          echo "DISK=$DISK PART=$PART"
+          diskutil list "$DISK"
+          resize_ok=0
+          if diskutil apfs resizeContainer "$PART" 10g; then
+            resize_ok=1
+          else
+            echo "explicit 10g resize failed; repairing GPT"
+            printf 'y\n' | diskutil repairDisk "$DISK" || true
+            if diskutil apfs resizeContainer "$PART" 0; then
+              resize_ok=1
+            else
+              CONTAINER=$(diskutil list | awk '/Apple_APFS Container/ {print $NF; exit}')
+              echo "trying container reference: $CONTAINER"
+              if diskutil apfs resizeContainer "$CONTAINER" 0; then resize_ok=1; fi
+            fi
+          fi
+          echo "resize_ok=$resize_ok"
+          if [ "$resize_ok" != 1 ]; then
+            diskutil apfs list || true
+            df -h /
+            echo "::error::APFS resizeContainer failed"
+            exit 1
+          fi
+          diskutil apfs list | tee /tmp/apfs-list.txt
+          df -h /
+          hdiutil detach "$DISK" -force || true
+          ls -lh os-rw.dmg
+      - name: Add Data and Preboot volumes and mountpoint skeletons
+        run: |
+          set -euo pipefail
+          cd /tmp/apfs
+          hdiutil attach -readwrite -nobrowse -nomount os-rw.dmg | tee /tmp/attach-roles.txt
+          DISK=$(awk '/\/dev\/disk/ {print $1; exit}' /tmp/attach-roles.txt)
+          echo "DISK=$DISK"
+          CONTAINER=$(diskutil list "$DISK" | awk '/Apple_APFS Container/ {print $4; exit}')
+          echo "CONTAINER=$CONTAINER"
+          diskutil apfs list "$CONTAINER" | tee /tmp/apfs-before-roles.txt
+          SYSTEMVOL=$(diskutil apfs list "$CONTAINER" | grep -E 'APFS Volume Disk \(Role\):.*\(System\)' | sed -E 's/.* (disk[0-9]+s[0-9]+).*/\1/' | head -1)
+          echo "SYSTEMVOL=$SYSTEMVOL"
+          [ -n "$SYSTEMVOL" ] || { echo "::error::System volume not found"; exit 1; }
+          diskutil mount "$SYSTEMVOL" || true
+          sudo diskutil apfs addVolume "$CONTAINER" APFS Data -role D
+          sudo diskutil apfs addVolume "$CONTAINER" APFS Preboot -role B
+          diskutil apfs list "$CONTAINER" | tee /tmp/apfs-list.txt
+          SYS_MOUNT=$(mount | awk '/\/Volumes\/DawnUpdate/ {print $3; exit}')
+          if [ -z "$SYS_MOUNT" ]; then
+            for m in /Volumes/*; do
+              if [ -d "$m/System/Library" ]; then SYS_MOUNT="$m"; fi
+            done
+          fi
+          echo "SYS_MOUNT=$SYS_MOUNT"
+          [ -n "$SYS_MOUNT" ] || { echo "::error::System volume mountpoint not found"; exit 1; }
+          D=/Volumes/Data
+          diskutil mount -mountPoint "$D" "$(diskutil apfs list "$CONTAINER" | awk '/Volume disk/ {v=$2} /\(Data\)/ {print v; exit}')" 2>/dev/null || true
+          [ -d "$D" ] || { echo "::error::Data volume not mounted at /Volumes/Data"; exit 1; }
+          sudo mkdir -p "$SYS_MOUNT/System/Volumes/Data" "$SYS_MOUNT/System/Volumes/Preboot"
+          sudo mkdir -p "$D/private/var/log" "$D/private/var/db" "$D/private/var/tmp" "$D/private/var/run" \
+            "$D/private/var/mobile/Library" "$D/private/var/mobile/Media" "$D/private/var/root" \
+            "$D/private/var/empty" "$D/private/var/audit" "$D/private/var/vm" \
+            "$D/private/var/keychains" "$D/private/var/preferences/Logging" "$D/private/var/networkd"
+          sudo chmod 755 "$D/private" "$D/private/var"
+          VARSRC="$SYS_MOUNT/private/var"
+          {
+            echo "### firmlinks (OS volume)"
+            cat "$SYS_MOUNT/usr/share/firmlinks" 2>/dev/null || echo "no firmlinks in OS volume"
+            echo "### firmlinks (runner host)"
+            cat /usr/share/firmlinks 2>/dev/null || echo "no host firmlinks"
+            echo "### System/Volumes listing"
+            ls -la "$SYS_MOUNT/System/Volumes/"
+            echo "### Data /private/var du"
+            du -sh "$D/private/var"
+            echo "### Data df"
+            df -h "$D"
+            echo "### OS private/var size (MB)"
+            du -sm "$VARSRC" 2>/dev/null || true
+          } | tee /tmp/roles-report.txt
+          SIZE_MB=$(du -sm "$VARSRC" 2>/dev/null | awk '{print $1}' || echo 0)
+          if [ "${SIZE_MB:-0}" -lt 700 ]; then
+            echo "copying OS /private/var skeleton (${SIZE_MB}MB)"
+            sudo rsync -a --ignore-existing "$VARSRC/" "$D/private/var/" || true
+          else
+            echo "skipping OS /private/var copy (${SIZE_MB}MB >= 700MB)"
+          fi
+          du -sh "$D/private/var" | tee -a /tmp/roles-report.txt
+          hdiutil detach "$DISK" -force || true
+          ls -lh os-rw.dmg
+      - name: Mount expanded OS, copy cache
+        run: |
+          set -euo pipefail
+          cd /tmp/apfs
+          hdiutil attach -readwrite -nobrowse os-rw.dmg | tee /tmp/attach-rw.txt
+          OSDISK=$(awk '/\/dev\/disk/ {print $1; exit}' /tmp/attach-rw.txt)
+          echo "OSDISK=$OSDISK"
+          OVOL=$(ls -d /Volumes/DawnUpdate* 2>/dev/null | head -1)
+          if [ -z "${OVOL:-}" ]; then
+            for m in /Volumes/*; do
+              case "$m" in *DawnUpdate*) if [ -d "$m/System/Library" ]; then OVOL="$m"; fi;; esac
+            done
+          fi
+          if [ -z "${OVOL:-}" ]; then
+            diskutil mount "$OSDISK"
+            OVOL=$(df -h | awk '/\/Volumes\// {print $NF; exit}')
+          fi
+          echo "OVOL=$OVOL"
+          df -h "$OVOL" | tee /tmp/df-osvol.txt
+          mkdir -p "$OVOL/System/Library/Caches/com.apple.dyld"
+          rsync -a --exclude='*.symbols' dyldcache/ "$OVOL/System/Library/Caches/com.apple.dyld/"
+          find "$OVOL/System/Library/Caches/com.apple.dyld" -type f | wc -l
+          du -sh "$OVOL/System/Library/Caches/com.apple.dyld"
+          find "$OVOL/System/Library/Caches/com.apple.dyld" -maxdepth 1 -type f -exec shasum -a 256 {} \; | tee /tmp/copied-sha.txt
+          sudo chown -R 0:0 "$OVOL/System/Library/Caches/com.apple.dyld"
+          sync
+          hdiutil detach "$OSDISK"
+          df -h /
+      - name: Export enlarged raw image
+        run: |
+          set -euo pipefail
+          cd /tmp/apfs
+          SZ=$(stat -f%z os-rw.dmg)
+          DISKSIZE=$((SZ - 512))
+          echo "os-rw.dmg size=$SZ  raw disk size=$DISKSIZE"
+          DEV=$(hdiutil attach -readwrite -nobrowse -nomount os-rw.dmg | awk '/\/dev\/disk/ {print $1; exit}')
+          RDEV=$(echo "$DEV" | sed 's#/dev/disk#/dev/rdisk#')
+          echo "DEV=$DEV RDEV=$RDEV"
+          sudo dd if="$RDEV" of=os-flat.img bs=1048576 count=$((DISKSIZE/1048576+1))
+          sudo chown "$(id -u):$(id -g)" os-flat.img
+          truncate -s "$DISKSIZE" os-flat.img
+          stat -f%z os-flat.img | tee os-flat.size
+          shasum -a 256 os-flat.img | tee os-flat.sha256
+          hdiutil detach "$DEV"
+          df -h /
+      - name: gzip and split
+        run: |
+          set -euo pipefail
+          cd /tmp/apfs
+          gzip -1 -c os-flat.img > os-flat.img.gz
+          rm -f os-flat.img
+          ls -lh os-flat.img.gz
+          if [ "$(stat -f%z os-flat.img.gz)" -gt 1992294400 ]; then
+            split -b 1800m os-flat.img.gz os-flat.img.gz.part-
+            rm -f os-flat.img.gz
+          fi
+          shasum -a 256 os-flat.img.gz* | tee os-flat.parts.sha256
+          cp /tmp/apfs-list.txt apfs-list.txt
+          cp /tmp/addvolume-help.txt addvolume-help.txt 2>/dev/null || true
+          cp /tmp/volume-group.txt volume-group.txt 2>/dev/null || true
+          cp /tmp/roles-report.txt roles-report.txt 2>/dev/null || true
+          cp /tmp/add-data-group.txt add-data-group.txt 2>/dev/null || true
+          cp /tmp/add-data-sibling.txt add-data-sibling.txt 2>/dev/null || true
+          cp /tmp/df-osvol.txt df-osvol.txt
+          cp /tmp/dyld-list.txt dyld-list.txt
+          cp /tmp/dyld-sha.txt dyld-sha.txt
+          cp /tmp/copied-sha.txt copied-sha.txt
+          ls -lh
+      - name: Upload to private release
+        run: |
+          set -euo pipefail
+          cd /tmp/apfs
+          export GH_TOKEN="$PRIVATE_UPLOAD_TOKEN"
+          gh release view "$RELEASE_TAG" --repo "$PRIVATE_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$RELEASE_TAG" --repo "$PRIVATE_REPOSITORY" \
+                 --title "APFS 10g OS raw $RELEASE_TAG" \
+                 --notes "Expanded OS raw image with dyld shared cache in /System/Library/Caches/com.apple.dyld. Apple-derived; private."
+          files=(os-flat.img.gz* os-flat.size os-flat.sha256 os-flat.parts.sha256 apfs-list.txt roles-report.txt)
+          for f in addvolume-help.txt df-osvol.txt dyld-list.txt dyld-sha.txt copied-sha.txt volume-group.txt; do
+            [ -f "$f" ] && files+=("$f")
+          done
+          gh release upload "$RELEASE_TAG" --repo "$PRIVATE_REPOSITORY" --clobber "${files[@]}"
+      - name: Summary
+        if: always()
+        run: |
+          cd /tmp/apfs || exit 0
+          {
+            echo "### runner ${{ inputs.runner_label }}"
+            echo '```'
+            cat os-flat.size 2>/dev/null || true
+            cat os-flat.sha256 2>/dev/null || true
+            cat os-flat.parts.sha256 2>/dev/null || true
+            cat /tmp/dyld-list.txt 2>/dev/null || true
+            cat /tmp/dyld-sha.txt 2>/dev/null || true
+            cat /tmp/df-osvol.txt 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
